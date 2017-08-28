@@ -1,12 +1,12 @@
 <#PSScriptInfo
 
-.VERSION 1.8.1.1
+.VERSION 1.9.0.0
 
 .GUID b4e8f9aa-1433-4d8b-8aea-8681fbdfde8c
 
-.AUTHOR Nik Charlebois
+.AUTHOR Microsoft Corporation
 
-.COMPANYNAME Microsoft
+.COMPANYNAME Microsoft Corporation
 
 .EXTERNALMODULEDEPENDENCIES
 
@@ -36,6 +36,7 @@ param([switch]$SkipFeatures,
       [switch]$SkipUserProfile,
       [switch]$Lite,
       [switch]$Standalone,
+      [switch]$FreshCredentials,
       [Boolean]$Confirm = $true,
       [String]$OutputFile = $null)
 
@@ -47,7 +48,7 @@ $Script:DH_SPQUOTATEMPLATE = @{}
 
 <## Scripts Variables #>
 $Script:dscConfigContent = ""
-$SPDSCSource = "C:\Program Files\WindowsPowerShell\Modules\SharePointDSC\"
+$SPDSCSource = "$env:ProgramFiles\WindowsPowerShell\Modules\SharePointDSC\"
 $SPDSCVersion = "1.8.0.0"
 
 try {
@@ -59,7 +60,12 @@ catch {
     $Script:version = "N/A"
 }
 $Script:SPDSCPath = $SPDSCSource + $SPDSCVersion
-$Global:spFarmAccount = ""
+<## If we've specified FreshCredentials, let's clear previous credentials, if they exist ##>
+if (($FreshCredentials) -and ($null -ne $Global:spFarmAccount))
+{
+    Write-Host "Clearing previously-saved credentials..." -BackgroundColor DarkGreen -ForegroundColor White
+    $Global:spFarmAccount = $null
+}
 
 <## Set the Lite switch #>
 if($Lite)
@@ -85,8 +91,12 @@ function Orchestrator
     
     Import-Module -Name $module -Force
 
-    $Global:spFarmAccount = Get-Credential -Message "Credentials with Farm Admin Rights" -UserName $env:USERDOMAIN\$env:USERNAME
-    Save-Credentials $Global:spFarmAccount
+    <## Only prompt if we don't already have the farm admin credentials ##>
+    if (!($Global:spFarmAccount))
+    {
+        $Global:spFarmAccount = Get-Credential -Message "Credentials with Farm Admin Rights" -UserName $env:USERDOMAIN\$env:USERNAME
+        $catch = Save-Credentials $Global:spFarmAccount
+    }
 
     $Global:spCentralAdmin = Get-SPWebApplication -IncludeCentralAdministration | Where-Object{$_.DisplayName -like '*Central Administration*'}
     $spFarm = Get-SPFarm
@@ -347,6 +357,9 @@ function Orchestrator
 
                 Write-Host "["$spServer.Name"] Scanning Farm Password Change Settings..." -BackgroundColor DarkGreen -ForegroundColor White
                 Read-SPPasswordChangeSettings
+
+                Write-Host "["$spServer.Name"] Scanning Service Application(s) Security Settings..." -BackgroundColor DarkGreen -ForegroundColor White
+                Read-SPServiceAppSecurity
             }
 
             Write-Host "["$spServer.Name"] Scanning Service Instance(s)..." -BackgroundColor DarkGreen -ForegroundColor White
@@ -1147,7 +1160,7 @@ function Read-SPServiceInstance ($Servers)
                     Import-Module $module
                     $params = Get-DSCFakeParameters -ModulePath $module
                     $params.Ensure = $ensureValue
-                    $params.FarmAccount = $Global:spFarmAccount            
+                    $params.FarmAccount = $Global:spFarmAccount
                     $results = Get-TargetResource @params
                     if($ensureValue -eq "Present")
                     {            
@@ -1984,6 +1997,18 @@ function Get-SPCrawlSchedule($params)
     }
     $currentSchedule += "            }"
     return $currentSchedule
+}
+
+function Get-SPServiceAppSecurityMembers($member)
+{
+    if(!($member.AccessLevel -match "^[\d\.]+$"))
+    {
+        return "MSFT_SPServiceAppSecurityEntry {`
+                                Username    = `"" + $member.UserName + "`";`
+                                AccessLevel = `"" + $member.AccessLevel + "`";`
+        }"
+    }
+    return $null
 }
 
 function Get-SPWebPolicyPermissions($params)
@@ -2921,6 +2946,67 @@ function Read-SPPasswordChangeSettings
     }
 }
 
+function Read-SPServiceAppSecurity
+{
+    $module = Resolve-Path ($Script:SPDSCPath + "\DSCResources\MSFT_SPServiceAppSecurity\MSFT_SPServiceAppSecurity.psm1")
+    Import-Module $module
+    $params = Get-DSCFakeParameters -ModulePath $module
+    $serviceApplications = Get-SPServiceApplication | Where-Object {$_.TypeName -ne "Usage and Health Data Collection Service Application"}
+
+    foreach($serviceApp in $serviceApplications)
+    {
+        $params.ServiceAppName = $serviceApp.Name
+        $params.SecurityType = "SharingPermissions"
+        
+        $fake = New-CimInstance -ClassName Win32_Process -Property @{Handle=0} -Key Handle -ClientOnly
+        $params.Members = $fake
+        $params.Remove("MembersToInclude")
+        $params.Remove("MembersToExclude")
+        $results = Get-TargetResource @params
+
+        $Script:dscConfigContent += "        `$members = @();`r`n"
+        
+        $results = Repair-Credentials -results $results 
+        $results.Remove("MembersToInclude")
+        $results.Remove("MembersToExclude")
+        $stringMember = ""
+        foreach($member in $results.Members)
+        {
+            $stringMember = Get-SPServiceAppSecurityMembers $member
+            if($stringMember -ne $null)
+            {
+                $Script:dscConfigContent += "        `$members += " + $stringMember + ";`r`n"
+            }
+        }
+        
+        $Script:dscConfigContent += "        SPServiceAppSecurity " + [System.Guid]::NewGuid().ToString() + "`r`n"
+        $Script:dscConfigContent += "        {`r`n"
+        $results.Members = "`$members"
+        $Script:dscConfigContent += Get-DSCBlock -UseGetTargetResource -Params $results -ModulePath $module
+        $Script:dscConfigContent += "        }`r`n"
+
+        $params.SecurityType = "Administrators"
+        
+        $results = Get-TargetResource @params
+        $Script:dscConfigContent += "        `$members = @();`r`n"
+        $results = Repair-Credentials -results $results
+        $results.Remove("MembersToInclude")
+        $results.Remove("MembersToExclude")    
+        $stringMember = ""
+        foreach($member in $results.Members)
+        {
+            $stringMember = Get-SPServiceAppSecurityMembers $member
+            $Script:dscConfigContent += "        `$members += " + $stringMember + ";`r`n"
+        }
+        
+        $Script:dscConfigContent += "        SPServiceAppSecurity " + [System.Guid]::NewGuid().ToString() + "`r`n"
+        $Script:dscConfigContent += "        {`r`n"
+        $results.Members = "`$members"
+        $Script:dscConfigContent += Get-DSCBlock -UseGetTargetResource -Params $results -ModulePath $module
+        $Script:dscConfigContent += "        }`r`n" 
+    }
+}
+
 function Read-SPPublishServiceApplication 
 {
     $module = Resolve-Path ($Script:SPDSCPath + "\DSCResources\MSFT_SPPublishServiceApplication\MSFT_SPPublishServiceApplication.psm1")
@@ -3058,8 +3144,8 @@ function Get-SPReverseDSC()
         $OutputDSCPath = Read-Host "Please enter the full path of the output folder for DSC Configuration (will be created as necessary)"
     }
     else {
-        $fileName = $OutputFile.Split('/')[$OutputFile.Split('/').Length -1]
-        $OutputDSCPath = $OutputFile.Remove($OutputFile.LastIndexOf('/') + 1, $OutputFile.Length - ($OutputFile.LastIndexOf('/') + 1))
+        $fileName = $OutputFile.Split('\')[$OutputFile.Split('\').Length -1]
+        $OutputDSCPath = $OutputFile.Remove($OutputFile.LastIndexOf('\') + 1, $OutputFile.Length - ($OutputFile.LastIndexOf('\') + 1))
     }
 
     <## Ensures the specified output folder path actually exists; if not, tries to create it and throws an exception if we can't. ##>
